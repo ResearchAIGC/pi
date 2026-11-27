@@ -7,13 +7,14 @@
 
 import type { ImageContent, TextContent } from "@earendil-works/pi-ai";
 import type { Component } from "@earendil-works/pi-tui";
+import { keyHint, keyText } from "../../modes/interactive/components/keybinding-hints.ts";
 import type { Theme } from "../../modes/interactive/theme/theme.ts";
-import type { ToolDefinition, ToolRenderContext } from "../extensions/types.ts";
-import { ansiLinesToHtml } from "./ansi-to-html.ts";
+import type { ToolRenderContext, ToolRenderers } from "../extensions/types.ts";
+import { ansiLinesToHtml, stripAnsiEscapes } from "./ansi-to-html.ts";
 
 export interface ToolHtmlRendererDeps {
-	/** Function to look up tool definition by name */
-	getToolDefinition: (name: string) => ToolDefinition | undefined;
+	/** Renderers of calls to a tool, as resolved by extensions and the registered tool */
+	getToolRenderers: (name: string) => ToolRenderers | undefined;
 	/** Theme for styling */
 	theme: Theme;
 	/** Working directory for render context */
@@ -41,13 +42,11 @@ export interface ToolHtmlRenderer {
  * The renderer looks up tool definitions and invokes their renderCall/renderResult
  * methods, converting the resulting TUI Component output (ANSI) to HTML.
  */
-const ANSI_ESCAPE_REGEX = /\x1b\[[\d;]*m/g;
-
 function isBlankRenderedLine(line: string): boolean {
-	return line.replace(ANSI_ESCAPE_REGEX, "").trim().length === 0;
+	return stripAnsiEscapes(line).trim().length === 0;
 }
 
-function trimRenderedResultLines(lines: string[]): string[] {
+function trimRenderedResultLines(lines: readonly string[]): string[] {
 	let start = 0;
 	let end = lines.length;
 	while (start < end && isBlankRenderedLine(lines[start])) start++;
@@ -56,7 +55,7 @@ function trimRenderedResultLines(lines: string[]): string[] {
 }
 
 export function createToolHtmlRenderer(deps: ToolHtmlRendererDeps): ToolHtmlRenderer {
-	const { getToolDefinition, theme, cwd, width = 100 } = deps;
+	const { getToolRenderers, theme, cwd, width = 100 } = deps;
 
 	const renderedCallComponents = new Map<string, Component>();
 	const renderedResultComponents = new Map<string, Component>();
@@ -92,6 +91,10 @@ export function createToolHtmlRenderer(deps: ToolHtmlRendererDeps): ToolHtmlRend
 			expanded,
 			showImages: false,
 			isError,
+			durationMs: undefined,
+			outputPad: 1,
+			keyText,
+			keyHint,
 		};
 	};
 
@@ -99,7 +102,7 @@ export function createToolHtmlRenderer(deps: ToolHtmlRendererDeps): ToolHtmlRend
 		renderCall(toolCallId: string, toolName: string, args: unknown): string | undefined {
 			try {
 				renderedArgs.set(toolCallId, args);
-				const toolDef = getToolDefinition(toolName);
+				const toolDef = getToolRenderers(toolName);
 				if (!toolDef?.renderCall) {
 					return undefined;
 				}
@@ -126,7 +129,7 @@ export function createToolHtmlRenderer(deps: ToolHtmlRendererDeps): ToolHtmlRend
 			isError: boolean,
 		): { collapsed?: string; expanded?: string } | undefined {
 			try {
-				const toolDef = getToolDefinition(toolName);
+				const toolDef = getToolRenderers(toolName);
 				if (!toolDef?.renderResult) {
 					return undefined;
 				}

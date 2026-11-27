@@ -2,7 +2,6 @@
  * TUI component for managing package resources (enable/disable)
  */
 
-import { homedir } from "node:os";
 import { basename, dirname, join, relative } from "node:path";
 import {
 	type Component,
@@ -18,7 +17,8 @@ import {
 import { CONFIG_DIR_NAME } from "../../../config.ts";
 import type { PathMetadata, ResolvedPaths, ResolvedResource } from "../../../core/package-manager.ts";
 import type { PackageSource, SettingsManager } from "../../../core/settings-manager.ts";
-import { canonicalizePath, isLocalPath, resolvePath } from "../../../utils/paths.ts";
+import { BUILTIN_PATH_PREFIX, getResourcePathKey } from "../../../core/source-info.ts";
+import { isLocalPath, resolvePath, shortenHomePath } from "../../../utils/paths.ts";
 import { theme } from "../theme/theme.ts";
 import { DynamicBorder } from "./dynamic-border.ts";
 import { keyHint, rawKeyHint } from "./keybinding-hints.ts";
@@ -64,25 +64,16 @@ interface ResourceGroup {
 }
 
 function formatBaseDir(baseDir: string): string {
-	const homeDir = homedir();
-	let displayPath: string;
-
-	if (baseDir === homeDir) {
-		displayPath = "~";
-	} else if (baseDir.startsWith(homeDir)) {
-		// Replace home prefix with ~, normalize separators for display
-		const rest = baseDir.slice(homeDir.length);
-		displayPath = `~${rest.replace(/\\/g, "/")}`;
-	} else {
-		displayPath = baseDir.replace(/\\/g, "/");
-	}
-
+	const displayPath = shortenHomePath(baseDir).replace(/\\/g, "/");
 	return displayPath.endsWith("/") ? displayPath : `${displayPath}/`;
 }
 
 function getGroupLabel(metadata: PathMetadata, agentDir: string): string {
 	if (metadata.origin === "package") {
 		return `${metadata.source} (${metadata.scope})`;
+	}
+	if (metadata.source === "builtin") {
+		return metadata.scope === "user" ? "Built-in" : "Built-in (project override)";
 	}
 	// Top-level resources
 	if (metadata.source === "auto") {
@@ -131,7 +122,9 @@ function buildGroups(resolved: ResolvedPaths, agentDir: string): ResourceGroup[]
 			const fileName = basename(path);
 			const parentFolder = basename(dirname(path));
 			let displayName: string;
-			if (resourceType === "extensions" && parentFolder !== "extensions") {
+			if (metadata.source === "builtin") {
+				displayName = path.slice(BUILTIN_PATH_PREFIX.length);
+			} else if (resourceType === "extensions" && parentFolder !== "extensions") {
 				displayName = `${parentFolder}/${fileName}`;
 			} else if (resourceType === "skills" && fileName === "SKILL.md") {
 				displayName = parentFolder;
@@ -508,9 +501,11 @@ class ResourceList implements Component, Focusable {
 			return;
 		}
 
-		// Pass to search input
+		// Pass to search input. Cursor keys leave the query as it is and must not move the selection.
+		const previousQuery = this.searchInput.getValue();
 		this.searchInput.handleInput(data);
-		this.filterItems(this.searchInput.getValue());
+		const query = this.searchInput.getValue();
+		if (query !== previousQuery) this.filterItems(query);
 	}
 
 	private toggleResource(item: ResourceItem): boolean | undefined {
@@ -679,7 +674,9 @@ class ResourceList implements Component, Focusable {
 			return !(state === "inherit" && this.isInheritedGlobalItem(item) && target === pattern);
 		});
 		if (state !== "inherit") {
-			if (this.isInheritedGlobalItem(item) && !updated.includes(pattern)) updated.push(pattern);
+			// Project entries name inherited files to override them. Built-in paths need no entry.
+			if (this.isInheritedGlobalItem(item) && item.metadata.source !== "builtin" && !updated.includes(pattern))
+				updated.push(pattern);
 			updated.push(`${state === "load" ? "+" : "-"}${pattern}`);
 		}
 		this.setProjectTopLevelPaths(item.resourceType, updated);
@@ -795,7 +792,7 @@ class ResourceList implements Component, Focusable {
 
 	private getResourcePatternForScope(item: ResourceItem, scope: SettingsScope): string {
 		const sourceScope = this.getItemScope(item);
-		if (scope !== sourceScope) return item.path;
+		if (scope !== sourceScope || item.metadata.source === "builtin") return item.path;
 		const baseDir = item.metadata.baseDir ?? this.getTopLevelBaseDir(sourceScope);
 		return relative(baseDir, item.path);
 	}
@@ -840,7 +837,7 @@ class ResourceList implements Component, Focusable {
 	}
 
 	private getResourceItemKey(item: ResourceItem): string {
-		return `${item.resourceType}:${canonicalizePath(item.path)}`;
+		return `${item.resourceType}:${getResourcePathKey(item.path)}`;
 	}
 
 	private getItemScope(item: ResourceItem): SettingsScope {
@@ -852,6 +849,7 @@ class ResourceList implements Component, Focusable {
 	}
 
 	private getResourcePattern(item: ResourceItem): string {
+		if (item.metadata.source === "builtin") return item.path;
 		const scope = item.metadata.scope as "user" | "project";
 		const baseDir = item.metadata.baseDir ?? this.getTopLevelBaseDir(scope);
 		return relative(baseDir, item.path);

@@ -58,6 +58,21 @@ describe("scoped models selector", () => {
 		return selector;
 	}
 
+	// #5916
+	it("shows model names that differ from the ID", async () => {
+		const selector = await createSelector([
+			{ id: "model-a", name: "Model A", enabled: true },
+			{ id: "model-b", name: "Renamed B", enabled: true },
+		]);
+		const provider = harness!.models[0].provider;
+
+		const rows = stripAnsi(selector.render(120).join("\n"))
+			.split("\n")
+			.map((line) => line.slice(4).trimEnd());
+		expect(rows).toContain(`model-a [${provider}]`);
+		expect(rows).toContain(`model-b (Renamed B) [${provider}]`);
+	});
+
 	it("marks every model after enabling all", async () => {
 		const models = [
 			{ id: "model-a", name: "Model A", enabled: true },
@@ -122,5 +137,38 @@ describe("scoped models selector", () => {
 		expect(models.map((model) => model.enabled)).toEqual([true, true, true]);
 		expect(getMarkerStates(selector, models)).toEqual([true, true, true]);
 		expect(stripAnsi(selector.render(120).join("\n"))).toContain("all enabled");
+	});
+
+	// Regression test for #12245: the /login fix applied to /scoped-models.
+	it("selects the best match after typing a query, even after scrolling", async () => {
+		const models = [
+			{ id: "gpt-4o", name: "GPT-4o", enabled: true },
+			{ id: "gpt-4o-mini", name: "GPT-4o mini", enabled: true },
+			{ id: "claude", name: "Claude", enabled: true },
+			{ id: "gemini", name: "Gemini", enabled: true },
+		];
+		const selector = await createSelector(models);
+
+		for (let i = 0; i < 3; i++) selector.handleInput("\x1b[B");
+		for (const char of "gpt-4o") selector.handleInput(char);
+		selector.handleInput("\r");
+
+		expect(models.map((model) => model.enabled)).toEqual([false, true, true, true]);
+	});
+
+	it("keeps the selection when a cursor key leaves the query unchanged", async () => {
+		const models = [
+			{ id: "gpt-4o", name: "GPT-4o", enabled: true },
+			{ id: "gpt-4o-mini", name: "GPT-4o mini", enabled: true },
+			{ id: "claude", name: "Claude", enabled: true },
+		];
+		const selector = await createSelector(models);
+
+		for (const char of "gpt") selector.handleInput(char);
+		selector.handleInput("\x1b[B");
+		selector.handleInput("\x1b[D"); // Left
+		selector.handleInput("\r");
+
+		expect(models.map((model) => model.enabled)).toEqual([true, false, true]);
 	});
 });

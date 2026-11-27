@@ -40,6 +40,42 @@ describe("SettingsList", () => {
 		assert.deepStrictEqual(changes, [{ id: "tui-mode", value: "fullscreen" }]);
 	});
 
+	it("keeps the selection when a cursor key leaves the query unchanged", () => {
+		const changes: Array<{ id: string; value: string }> = [];
+		const list = new SettingsList(
+			["Alpha mode", "Beta mode", "Other"].map((label) => ({
+				id: label,
+				label,
+				currentValue: "off",
+				values: ["off", "on"],
+			})),
+			10,
+			testTheme,
+			(id, value) => changes.push({ id, value }),
+			() => {},
+			{ enableSearch: true },
+		);
+
+		// Line 0 is the search input; the selected setting is the row with the cursor below it.
+		const selectedRow = () =>
+			list
+				.render(80)
+				.slice(1)
+				.find((line) => line.startsWith("> "));
+
+		for (const character of "mode") list.handleInput(character);
+		list.handleInput("\x1b[B");
+		const browsed = selectedRow();
+		list.handleInput("\x1b[D"); // Left
+		list.handleInput("\x1b[H"); // Home
+
+		assert.notStrictEqual(browsed, undefined);
+		assert.strictEqual(selectedRow(), browsed);
+		list.handleInput("\r");
+		assert.strictEqual(changes.length, 1);
+		assert.ok(browsed?.includes(changes[0]!.id));
+	});
+
 	it("keeps Space as a change shortcut before a search query is entered", () => {
 		const changes: Array<{ id: string; value: string }> = [];
 		const list = new SettingsList(
@@ -54,5 +90,27 @@ describe("SettingsList", () => {
 		list.handleInput(" ");
 
 		assert.deepStrictEqual(changes, [{ id: "tui-mode", value: "fullscreen" }]);
+	});
+
+	it("moves by one visible page with selection page keys (#7629)", () => {
+		const list = new SettingsList(
+			Array.from({ length: 12 }, (_, index) => ({
+				id: `setting-${index}`,
+				label: `Setting ${index}`,
+				currentValue: String(index),
+			})),
+			5,
+			testTheme,
+			() => {},
+			() => {},
+		);
+
+		list.handleInput("\x1b[6~");
+		assert.match(list.render(80).join("\n"), /> Setting 5/);
+		list.handleInput("\x1b[6~");
+		list.handleInput("\x1b[6~");
+		assert.match(list.render(80).join("\n"), /> Setting 11/);
+		list.handleInput("\x1b[5~");
+		assert.match(list.render(80).join("\n"), /> Setting 6/);
 	});
 });

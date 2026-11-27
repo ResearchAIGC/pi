@@ -3,6 +3,7 @@ import { Type } from "typebox";
 import { describe, expect, it } from "vitest";
 import {
 	appendGrammarToolInputJsonDelta,
+	closeGrammarToolInputJson,
 	makeStrictJsonSchema,
 	resolveJsonSchemaStrictSampling,
 } from "../src/api/constrained-sampling.ts";
@@ -14,6 +15,7 @@ import {
 import type { AssistantMessage, Model, Tool, ToolCall } from "../src/types.ts";
 import { AssistantMessageEventStream } from "../src/utils/event-stream.ts";
 import { normalizeContext } from "../src/utils/transcript.ts";
+import { allocatedBytes } from "./memory-helpers.ts";
 
 function makeModel(): Model<"openai-responses"> {
 	return {
@@ -153,6 +155,15 @@ describe("constrained tool sampling", () => {
 		});
 	});
 
+	// #12049: OpenAI and Anthropic strict mode accept an enum without a type
+	it("keeps strict mode for enum-only schemas", () => {
+		const parameters = Type.Object({ level: Type.Enum({ Low: "low", High: "high" }) });
+		const tool = makeTool({ parameters, constrainedSampling: { type: "json_schema", strict: "prefer" } });
+
+		expect(parameters.properties.level).not.toHaveProperty("type");
+		expect(convertResponsesTools([tool], { supportsStrictMode: true })[0]).toMatchObject({ strict: true });
+	});
+
 	it("falls back or rejects schemas that cannot be safely converted", () => {
 		const cases: Array<{ parameters: Tool["parameters"]; error: string }> = [
 			{
@@ -176,6 +187,23 @@ describe("constrained tool sampling", () => {
 					required: ["child"],
 				} as Tool["parameters"],
 				error: "$ref schemas are unsupported",
+			},
+			// #12049: OpenAI strict mode rejects schema nodes without a type
+			{
+				parameters: Type.Object({ commandArguments: Type.Optional(Type.Array(Type.Unknown())) }),
+				error: "schemas without a type are unsupported",
+			},
+			{
+				parameters: Type.Object({ value: Type.Any({ description: "Any JSON value" }) }),
+				error: "schemas without a type are unsupported",
+			},
+			{
+				parameters: {
+					type: "object",
+					properties: { mode: { const: "fast" } },
+					required: ["mode"],
+				} as Tool["parameters"],
+				error: "schemas without a type are unsupported",
 			},
 		];
 
@@ -248,6 +276,7 @@ describe("constrained tool sampling", () => {
 			call_id: "call_1",
 			name: "sample_tool",
 			input: "abc",
+			status: "completed",
 		});
 		expect(messages).toContainEqual({
 			type: "custom_tool_call_output",
@@ -256,16 +285,117 @@ describe("constrained tool sampling", () => {
 		});
 	});
 
+	// earendil-works/radius#115: a gateway forwards another model's history as a foreign provider.
+	it("drops foreign item ids when replaying grammar calls as custom Responses items", () => {
+		const context = normalizeContext({
+			messages: [
+				{
+					role: "assistant",
+					api: "pi-messages",
+					provider: "radius",
+					model: "gpt-other",
+					content: [{ type: "toolCall", id: "call_1|ctc_1", name: "sample_tool", arguments: { payload: "abc" } }],
+					usage: makeUsage(),
+					stopReason: "toolUse",
+					timestamp: Date.now(),
+				},
+				{
+					role: "toolResult",
+					toolCallId: "call_1|ctc_1",
+					toolName: "sample_tool",
+					content: [{ type: "text", text: "done" }],
+					isError: false,
+					timestamp: Date.now(),
+				},
+			],
+		});
+
+		const messages = convertResponsesMessages(makeModel(), context, new Set(["openai"]), {
+			grammarToolInputProperties: new Map([["sample_tool", "payload"]]),
+		});
+
+		const call = messages.find((item) => "type" in item && item.type === "custom_tool_call");
+		expect(call).toMatchObject({ type: "custom_tool_call", call_id: "call_1", input: "abc" });
+		expect(call && "id" in call ? call.id : undefined).toBeUndefined();
+	});
+
 	it("keeps grammar input JSON deltas append-only", () => {
 		const buffer = { input: "", started: false, closed: false };
-		const first = appendGrammarToolInputJsonDelta(buffer, "payload", 'a"', false);
-		const second = appendGrammarToolInputJsonDelta(buffer, "payload", 'a"\nb', true);
+		const first = appendGrammarToolInputJsonDelta(buffer, "payload", 'a"');
+		const second = closeGrammarToolInputJson(buffer, "payload", 'a"\nb');
 
 		expect(JSON.parse(`${first}${second}`)).toEqual({ payload: 'a"\nb' });
-		expect(appendGrammarToolInputJsonDelta(buffer, "payload", 'a"\nb', true)).toBeUndefined();
-		expect(() => appendGrammarToolInputJsonDelta(buffer, "payload", "changed", true)).toThrow(
+		expect(closeGrammarToolInputJson(buffer, "payload", 'a"\nb')).toBeUndefined();
+		expect(() => closeGrammarToolInputJson(buffer, "payload", "changed")).toThrow(
 			'grammar tool input for property "payload" changed after it was closed',
 		);
+		expect(() => appendGrammarToolInputJsonDelta(buffer, "payload", "x")).toThrow(
+			'grammar tool input for property "payload" changed after it was closed',
+		);
+	});
+
+	it("rejects a final grammar input that does not continue the streamed input", () => {
+		const buffer = { input: "", started: false, closed: false };
+		appendGrammarToolInputJsonDelta(buffer, "payload", "abc");
+		expect(() => closeGrammarToolInputJson(buffer, "payload", "abd")).toThrow(
+			'grammar tool input for property "payload" changed non-monotonically',
+		);
+	});
+
+	// #9265
+	it("streams custom tool input in time and memory linear in its length", async () => {
+		const run = async (size: number) => {
+			const deltas = Array.from({ length: size / 32 }, (_, index) =>
+				`chunk ${index} "quoted" \\ \n`.padEnd(32, "x"),
+			);
+			const events = [
+				{
+					type: "response.output_item.added",
+					output_index: 0,
+					item: { type: "custom_tool_call", call_id: "call_1", id: "ctc_1", name: "sample_tool", input: "" },
+				},
+				...deltas.map((delta) => ({
+					type: "response.custom_tool_call_input.delta",
+					output_index: 0,
+					item_id: "ctc_1",
+					delta,
+				})),
+				{ type: "response.custom_tool_call_input.done", output_index: 0, item_id: "ctc_1", input: deltas.join("") },
+				{
+					type: "response.output_item.done",
+					output_index: 0,
+					item: {
+						type: "custom_tool_call",
+						call_id: "call_1",
+						id: "ctc_1",
+						name: "sample_tool",
+						input: deltas.join(""),
+					},
+				},
+				{
+					type: "response.completed",
+					response: { status: "completed", usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 } },
+				},
+			] as ResponseStreamEvent[];
+			const output = makeOutput();
+			const stream = new AssistantMessageEventStream();
+			const jsonDeltas: string[] = [];
+			const bytes = await allocatedBytes(async () => {
+				const consumed = (async () => {
+					for await (const event of stream) if (event.type === "toolcall_delta") jsonDeltas.push(event.delta);
+				})();
+				await processResponsesStream(iterateEvents(events), output, stream, makeModel(), {
+					grammarToolInputProperties: new Map([["sample_tool", "payload"]]),
+				});
+				stream.end();
+				await consumed;
+			});
+			expect(JSON.parse(jsonDeltas.join(""))).toEqual({ payload: deltas.join("") });
+			return bytes;
+		};
+		const small = await run(25_600);
+		const large = await run(256_000);
+		expect(large / small).toBeLessThan(25);
 	});
 
 	it("starts custom Responses tool calls with their initial input", async () => {
